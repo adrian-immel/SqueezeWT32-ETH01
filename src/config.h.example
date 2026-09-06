@@ -31,9 +31,7 @@
  * Logitech Media Server ports
  * ---------------------------------------------------------------------- */
 #define UDP_PORT       3483   /* slimproto discovery + command connection  */
-#define LMS_PORT       3483   /* command TCP connection                     */
-#define LMS_HTTP_PORT  9000   /* LMS HTTP interface used for the audio
-                                 stream (stream.mp3 / stream.flac)          */
+#define LMS_PORT       3483   /* command/stream TCP connection to the LMS  */
 
 /* -------------------------------------------------------------------------
  * Buffers.
@@ -45,11 +43,12 @@
  * AUDIO_BUFFER_SIZE      pre-decode network jitter buffer (was 4096). The
  *                        decoder reads compressed data from here, so bigger
  *                        = more tolerance to network bursts.
- * AUDIO_DMA_BUFFER_COUNT I2S DMA ring depth (ESP8266Audio 2.2.0 constructor
- *                        argument). More DMA buffers smooth out decoder
- *                        timing glitches.
+ * AUDIO_DMA_BUFFER_COUNT / AUDIO_DMA_BUFFER_BYTES
+ *                        I2S DMA ring depth (SetBuffers()). More/larger DMA
+ *                        buffers smooth out decoder timing glitches.
  * ---------------------------------------------------------------------- */
 #define AUDIO_BUFFER_SIZE        24576
 #define AUDIO_DMA_BUFFER_COUNT   8
+#define AUDIO_DMA_BUFFER_BYTES   2304
 
 #endif

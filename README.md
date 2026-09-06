@@ -10,14 +10,25 @@ project. Differences with the original:
 - WiFi + WiFiManager captive portal removed, wired **Ethernet only**
 - Audio output is a **PCM5102A I2S DAC** driven by the
   [ESP8266Audio](https://github.com/earlephilhower/ESP8266Audio) software
-  decoders (FLAC / MP3 / WAV). ESP8266Audio is pinned to **v2.2.0**: newer
-  releases require the new `i2s_std` driver that the classic ESP32 does not
-  have (only ESP32-S2/S3/C3).
+  decoders (FLAC / MP3 / WAV) plus a small native decoder for raw **PCM**
+  streams (the latter is what the Spoton / Spotify plugin sends)
+- Advertised codecs are only the ones that work: `flc`, `pcm`, `mp3`
 - VS1053 module, ESP8266 and flac_plugin code removed
 - Bigger audio pipeline buffers (the WiFi stack no longer eats the RAM)
 - Software volume control (gain applied to the samples, the PCM5102A has no
   volume register)
 - PlatformIO build
+
+## Platform note (why not the official espressif32 platform)
+
+The stock PlatformIO `espressif32` platform ships an Arduino core stuck at
+ESP-IDF 4.x. ESP8266Audio requires IDF 5.x (the new I2S driver) and fails with
+`cannot open source file "driver/i2s_std.h"`. As recommended by the
+[ESP8266Audio README](https://github.com/earlephilhower/ESP8266Audio#esp32-and-platformio),
+this project uses the community
+[pioarduino](https://github.com/pioarduino/platform-espressif32) platform,
+which is built from the current Espressif Arduino core (here pinned to
+`55.03.311` = Arduino core 3.3.11 / IDF 5.5.5).
 
 ## Wiring
 
@@ -43,12 +54,24 @@ The WT32-ETH01 Ethernet is configured in `src/main.cpp` for the LAN8720A PHY:
 ETH.begin(ETH_PHY_LAN8720, 1, 23, 18, 16, ETH_CLOCK_GPIO0_IN);
 ```
 
+This is the Arduino-ESP32 >= 3.1.0 argument order
+(`type, phy_addr, mdc, mdio, power, clk_mode`). On the older core 3.0.x the
+first two arguments were swapped (`phy_addr, power, mdc, mdio, type, clk`).
+
 - PHY address 1, MDC = GPIO23, MDIO = GPIO18
 - GPIO16 is driven high to enable the external 50 MHz RMII oscillator
 - 50 MHz REFCLK enters on GPIO0 (`ETH_CLOCK_GPIO0_IN`)
 
 The player finds the LMS by the slimproto **UDP autodiscovery** broadcast
 (like the original project). You must be on the same LAN as your server.
+
+## Audio transport
+
+Playback uses the native SlimProto streaming model (as SqueezeLite does) : the
+player opens a TCP connection to the LMS stream address carried in the `strm s`
+command (falling back to `LMS_PORT`), sends the HTTP request header verbatim,
+skips the HTTP response headers and feeds the remaining bytes to the
+ESP8266Audio decoder.
 
 ## Build & flash
 
@@ -73,8 +96,8 @@ Everything is in `src/config.h`:
 - `AUDIO_BUFFER_SIZE` : pre-decode network jitter buffer (default 24 KB,
   was 4 KB). Raise it if your network has bursts, lower it if you get
   allocation failures.
-- `AUDIO_DMA_BUFFER_COUNT` : I2S DMA ring depth (ESP8266Audio constructor arg).
-- `UDP_PORT` / `LMS_PORT` / `LMS_HTTP_PORT` : slimproto ports.
+- `AUDIO_DMA_BUFFER_COUNT` / `AUDIO_DMA_BUFFER_BYTES` : I2S DMA ring depth.
+- `UDP_PORT` / `LMS_PORT` : slimproto discovery/control port (default 3483).
 
 ## Serial log
 

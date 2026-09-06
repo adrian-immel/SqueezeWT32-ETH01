@@ -2,7 +2,8 @@
 #include "config.h"
 
 #include <ETH.h>
-#include <WiFi.h>   // provides the WiFiClient/WiFiUDP classes used over Ethernet
+#include <WiFi.h>     // provides the WiFiClient class used over Ethernet
+#include <WiFiUdp.h>  // WiFiUDP = NetworkUDP (works over Ethernet)
 
 #include "slimproto.h"
 
@@ -13,11 +14,11 @@
  * GPIO23/GPIO18 and the PHY address is 1.
  * See https://github.com/egnor/wt32-eth01
  *
- * NOTE : the ETH.begin() argument order depends on the Arduino-ESP32 core.
- * We are pinned to espressif32@7.1.1 (core 3.0.x) whose signature is
- *   begin(phy_addr, power, mdc, mdio, type, clk_mode[, use_mac_from_efuse])
- * On core >= 3.1.0 the order changed to
- *   begin(type, phy_addr, mdc, mdio, power, clk_mode)
+ * NOTE : this is the Arduino-ESP32 >= 3.1.0 argument order (pioarduino
+ * platform = core 3.3.11) :
+ *   begin(phy_type, phy_addr, mdc, mdio, power, clk_mode)
+ * On the older core 3.0.x it was
+ *   begin(phy_addr, power, mdc, mdio, type, clk_mode)
  */
 #define ETH_PHY_ADDR   1
 #define ETH_PHY_MDC    23
@@ -105,8 +106,8 @@ void setup()
   Serial.printf("Compiled %s %s\n", __DATE__, __TIME__);
   Serial.printf("Free heap at boot : %u bytes\n", ESP.getFreeHeap());
 
-  ETH.begin(ETH_PHY_ADDR, ETH_PHY_POWER, ETH_PHY_MDC, ETH_PHY_MDIO,
-            ETH_PHY_LAN8720, ETH_CLOCK_GPIO0_IN);
+  ETH.begin(ETH_PHY_LAN8720, ETH_PHY_ADDR, ETH_PHY_MDC, ETH_PHY_MDIO,
+            ETH_PHY_POWER, ETH_CLOCK_GPIO0_IN);
   waitForEthernet();
 
   udp.begin(UDP_PORT);

@@ -5,7 +5,7 @@
 #include <Arduino.h>
 #include <Client.h>
 
-#include <AudioFileSourceICYStream.h>
+#include <AudioFileSource.h>
 #include <AudioFileSourceBuffer.h>
 #include <AudioGeneratorMP3.h>
 #include <AudioGeneratorFLAC.h>
@@ -131,6 +131,30 @@ public:
    **/
   int HandleAudio();
 
+  /**
+   * True when a "strm q/s" command was parked while the decoder sat in a
+   * stream read ; the audio source uses it to unblock itself.
+   **/
+  bool StreamAbortPending() { return vcPendingStreamCmd; }
+
+  /**
+   * Process LMS control traffic from inside a blocking stream read.
+   * Stream start/stop commands are only parked (see vcPendingCmd).
+   * Returns false when the control link went down.
+   **/
+  int PumpControlDuringAudio();
+
+  bool IsPaused() { return vcPlayerStat == PauseStatus; }
+
+  /**
+   * Push silence samples into the I2S DMA while the stream is stalled.
+   * Without this, the circular DMA re-emits its last buffer forever
+   * (the "stuck CD" sound) while we wait for the server to resume or stop.
+   **/
+  void FeedIdleSamples();
+
+  void AddStreamBytes(uint32_t pBytes) { ByteReceivedCurrentSong += pBytes; }
+
 private:
   void HandleCommand(byte pCommand [], int pSize);
   void HandleStrmQCmd(byte pCommand [], int pSize);
@@ -140,8 +164,10 @@ private:
   void HandleStrmUCmd(byte pCommand [], int pSize);
   void HandleAudgCmd(byte pCommand [], int pSize);
 
+  void DeferStreamCmd(byte pCommand [], int pSize);
+  void ExecutePendingStreamCmd();
+
   void ByteArrayCpy(byte * pDst, byte * pSrv, int pSize);
-  void PrintByteArray(byte * psrc, int pSize);
 
   u32_t unpackN(u32_t *src);
 
@@ -160,11 +186,21 @@ private:
 
   Client * vcClient;            // Client to handle control messages
 
-  // Decoder chain : HTTP stream -> jitter buffer -> generator -> I2S out
+  // "strm q/s" commands received while the decoder sits in a blocking
+  // stream read are parked here and executed at the next HandleAudio() :
+  // running them inline would free the decoder chain from inside it.
+  bool vcPendingStreamCmd = false;
+  int  vcPendingSize = 0;
+  byte vcPendingCmd[600];
+  bool vcPumpingFromAudio = false;  // commands come from inside a stream read
+
+  Client * vcStreamClient = 0;  // TCP connection used to fetch the audio stream
+  AudioFileSource * vcDacSrc = 0;   // Raw source reading from vcStreamClient
+
+  // Decoder chain : stream socket -> jitter buffer -> generator -> I2S out
   AudioGenerator *           vcDacAudioGen = 0;
-  AudioFileSourceICYStream * vcDacFile = 0;
   AudioFileSourceBuffer *    vcDacBuff = 0;
-  AudioOutputI2S *           vcDacOut = 0;
+  class DacOutput *          vcDacOut = 0;
 
   // Current software volume gain (0.0 .. 1.0), PCM5102A has no register
   float vcVolumeGain = 1.0f;
