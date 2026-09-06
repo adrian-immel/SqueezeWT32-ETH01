@@ -1,0 +1,55 @@
+/*
+ * SqueezeWT32-ETH01 - configuration
+ *
+ * Copy this file to "src/config.h" and adjust if needed.
+ *
+ * Note: unlike the original SqueezeESP32 project there is no WiFi and no
+ * WiFiManager captive portal. This build uses the WT32-ETH01 wired Ethernet
+ * only, so the server is found with the slimproto UDP autodiscovery broadcast.
+ */
+#ifndef config_h
+#define config_h
+
+#define I2S_DAC_MODULE
+
+/* -------------------------------------------------------------------------
+ * PCM5102A I2S wiring
+ *
+ *   PCM5102A   WT32-ETH01
+ *   BCK         IO33
+ *   LRCK (WS)   IO32
+ *   DIN         IO17
+ *   VIN         5V
+ *   GND         GND
+ *   LOUT/ROUT   amplifier / speakers
+ * ---------------------------------------------------------------------- */
+#define I2S_BCK_PIN    33
+#define I2S_LRCK_PIN   32
+#define I2S_DOUT_PIN   17
+
+/* -------------------------------------------------------------------------
+ * Logitech Media Server ports
+ * ---------------------------------------------------------------------- */
+#define UDP_PORT       3483   /* slimproto discovery + command connection  */
+#define LMS_PORT       3483   /* command TCP connection                     */
+#define LMS_HTTP_PORT  9000   /* LMS HTTP interface used for the audio
+                                 stream (stream.mp3 / stream.flac)          */
+
+/* -------------------------------------------------------------------------
+ * Buffers.
+ *
+ * The WiFi stack (and the several dozen KB of buffers it grabs at runtime)
+ * is gone, so we can afford a much deeper audio pipeline. Tune these down if
+ * you get memory allocation failures in the serial log.
+ *
+ * AUDIO_BUFFER_SIZE      pre-decode network jitter buffer (was 4096). The
+ *                        decoder reads compressed data from here, so bigger
+ *                        = more tolerance to network bursts.
+ * AUDIO_DMA_BUFFER_COUNT I2S DMA ring depth (ESP8266Audio 2.2.0 constructor
+ *                        argument). More DMA buffers smooth out decoder
+ *                        timing glitches.
+ * ---------------------------------------------------------------------- */
+#define AUDIO_BUFFER_SIZE        24576
+#define AUDIO_DMA_BUFFER_COUNT   8
+
+#endif
