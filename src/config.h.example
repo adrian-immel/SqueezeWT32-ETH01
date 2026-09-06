@@ -36,18 +36,31 @@
 /* -------------------------------------------------------------------------
  * Buffers.
  *
- * The WiFi stack (and the several dozen KB of buffers it grabs at runtime)
- * is gone, so we can afford a much deeper audio pipeline. Tune these down if
- * you get memory allocation failures in the serial log.
+ * Static RAM use of this build is about 33 KB (see the linker map), the rest
+ * of the internal DRAM is heap. The WiFi stack is gone (wired Ethernet only)
+ * so there is plenty of room for a deep audio pipeline. Tune these down if
+ * you get allocation failures in the serial log.
  *
- * AUDIO_BUFFER_SIZE      pre-decode network jitter buffer (was 4096). The
- *                        decoder reads compressed data from here, so bigger
- *                        = more tolerance to network bursts.
+ * AUDIO_BUFFER_SIZE      pre-decode network jitter buffer. The decoder reads
+ *                        the compressed bytes from here, so bigger = longer
+ *                        stall tolerance : when the server feeds faster than
+ *                        real time (FLAC/MP3) the buffer fills and absorbs a
+ *                        stalling stream. Raw PCM (SlimProto format 'p')
+ *                        arrives at real time, so the buffer only holds
+ *                        whatever burst the server already pushed - it can
+ *                        not grow on its own. Default 64 KB.
+ * AUDIO_BUFFER_REFILL_GOAL
+ *                        a blocking prefill returns as soon as this many
+ *                        bytes have arrived instead of waiting for a full
+ *                        AUDIO_BUFFER_SIZE. Keeps the start-of-song gap at
+ *                        ~93 ms of 44.1 kHz stereo PCM (~16 KB) and lets the
+ *                        buffer top itself up in the background afterwards.
  * AUDIO_DMA_BUFFER_COUNT / AUDIO_DMA_BUFFER_BYTES
  *                        I2S DMA ring depth (SetBuffers()). More/larger DMA
  *                        buffers smooth out decoder timing glitches.
  * ---------------------------------------------------------------------- */
-#define AUDIO_BUFFER_SIZE        24576
+#define AUDIO_BUFFER_SIZE        65536   /* 64 KB default */
+#define AUDIO_BUFFER_REFILL_GOAL 16384
 #define AUDIO_DMA_BUFFER_COUNT   8
 #define AUDIO_DMA_BUFFER_BYTES   2304
 

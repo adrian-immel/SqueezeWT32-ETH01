@@ -30,15 +30,15 @@ void StatusCallback(void *cbData, int code, const char *string)
  * stream client.
  *
  * read() collects until the request is fully satisfied (that is what keeps
- * the jitter buffer pre-filled, required for real-time rate streams like
- * Spoton PCM). A gap in the data is NOT end of stream : endless streams
- * (Spoton) legitimately pause feeding while the socket stays open. Only a
- * closed socket terminates the stream.
+ * the jitter buffer pre-filled, required for real-time raw PCM streams). A
+ * gap in the data is NOT end of stream : endless streams can legitimately
+ * pause feeding while the socket stays open. Only a closed socket terminates
+ * the stream.
  *
  * While waiting for bytes the LMS control socket is pumped (pause/unpause/
  * volume handled inline, start/stop parked as a pending command) so the
- * player stays responsive even though the decoder sits inside this read
- * ("stuck audio" fix), without ever tearing down the chain from under us.
+ * player stays responsive even though the decoder sits inside this read,
+ * without tearing the decoder chain down from under it.
  */
 class StreamAudioSource : public AudioFileSource {
 public:
@@ -104,19 +104,25 @@ public:
           break;           // song change/stop parked : unblock the decoder
         }
         // Feed silence into the I2S DMA while stalled, otherwise the
-        // circular DMA re-emits its last contents ("stuck CD").
+        // circular DMA re-emits its last contents.
         vOwner->FeedIdleSamples();
       }
 
-      // Jitter-buffer sized refill : a 16 KB head start is pre-fill enough,
-      // return instead of waiting for the full 24 KB (halves the audible
-      // gap when refilling after an underflow ; AudioFileSourceBuffer keeps
-      // topping the buffer up opportunistically afterwards). Small decoder
-      // requests still wait for the full length (alignment matters there).
-      if (got >= 16384)
+      // Refill head start : once the jitter buffer has this much data again,
+      // return instead of waiting for the full AUDIO_BUFFER_SIZE so the
+      // decoder can resume quickly after an underflow. The buffer keeps
+      // topping itself up opportunistically afterwards (AudioFileSourceBuffer
+      // calls readNonBlock on every read). Small decoder requests still wait
+      // for their full length (alignment matters there).
+      if (got >= AUDIO_BUFFER_REFILL_GOAL)
         break;
 
-      // Half-dead stream watchdog (not while paused on purpose)
+      // Half-dead stream watchdog (not while paused on purpose). Do not
+      // accumulate paused time either : refresh the deadline so that a long
+      // pause followed by an unpause starts a fresh 30s countdown.
+      if (vOwner && vOwner->IsPaused())
+        viDeadline = millis() + 30000UL;
+
       if (vOwner && !vOwner->IsPaused() &&
           (long)(millis() - viDeadline) >= 0)
       {
@@ -148,7 +154,10 @@ public:
   }
 
   virtual uint32_t getSize() override {
-    return 0;
+    // Live stream : length unknown. Never return 0 here - the FLAC decoder
+    // asks its eof callback (getPos() >= getSize()) BEFORE every read and
+    // would see 0 >= 0 and bail out as end-of-stream without reading a byte.
+    return 0xFFFFFFFFUL;
   }
 
   virtual bool loop() override {
@@ -216,7 +225,7 @@ static uint32_t pcmRateFromCode(byte pCode)
 
 /**
  * Minimal generator that plays a raw little/big-endian PCM stream (SlimProto
- * format 'p', as sent e.g. by the Spoton/Spotify plugin). Sample rate,
+ * format 'p', as transcoded by the server for some sources). Sample rate,
  * number of channels and bit depth come from the "strm s" command fields.
  */
 class AudioGeneratorPCM : public AudioGenerator {
@@ -325,7 +334,10 @@ private:
 
 /**
  * I2S output with the DMA state exposed (feed-idle-silence guard).
- * Never call flush() on it : that plays out the queued samples.
+ *
+ * NOTE : never call flush() on this output. flush() plays out the whole DMA
+ * queue before returning ; on a paused/stalled stream that replays the last
+ * buffered audio. stop() disables the channel and discards the DMA instead.
  */
 class DacOutput : public AudioOutputI2S {
 public:
@@ -366,7 +378,7 @@ reponseHelo::reponseHelo(Client * pClient, const uint8_t pMac[6]) : responseBase
 
 void reponseHelo::sendResponse()
 {
-  vcResponse.sizeResponse = __builtin_bswap32(sizeof(vcResponse) - 8); // N'inclus pas la commande ni la taille.
+  vcResponse.sizeResponse = __builtin_bswap32(sizeof(vcResponse) - 8); // excludes the command opcode and size field
   vcClient->write((const uint8_t *) &vcResponse, sizeof(vcResponse));
 }
 
@@ -404,7 +416,6 @@ slimproto::slimproto(String pAdrLMS, Client * pClient)
 
   LastStatMsg = millis();
   StartTimeCurrentSong = 0;
-  EndTimeCurrentSong = 0;
   ByteReceivedCurrentSong = 0;
 
   Serial.printf("slimproto connected to LMS @ %s - free heap %u bytes\n",
@@ -433,9 +444,11 @@ int slimproto::HandleMessages()
       vcCommandSize = (viExtractSize[0] << 8) | viExtractSize[1];
     }
 
-    if(vcCommandSize > 250)
+    // Out of spec : nothing we send or receive is larger than the parked
+    // "strm" command buffer (600 bytes), so anything bigger is framing garbage.
+    // Flush it to resynchronise on the next length prefix.
+    if(vcCommandSize > (int) sizeof(vcPendingCmd))
     {
-      // Out of spec, flush the garbage
       Serial.println("Oversized command received, flushing");
       while(vcClient->available() && vcCommandSize--)
         vcClient->read();
@@ -471,7 +484,7 @@ int slimproto::HandleAudio()
     ExecutePendingStreamCmd();
 
   // While paused the I2S channel stays enabled, so keep pushing silence :
-  // otherwise the circular DMA would re-emit its last content ("stuck CD").
+  // otherwise the circular DMA would re-emit its last content.
   if(vcPlayerStat == PauseStatus)
   {
     FeedIdleSamples();
@@ -496,23 +509,16 @@ int slimproto::HandleAudio()
     if(vcPendingStreamCmd)
       return 0;   // interrupted by a parked strm q/s, not a real EOS
 
-    // Decoder reached a genuine end of stream (server closed the socket).
-    // Tell the server decoding finished ("STMd") : without it LMS/Spoton
-    // keeps the player in playing state and never sends a new stream
-    // (audio stays dead until the Connect session is re-created).
-    // Safe to send here : EOS is detected within ms of the socket close and
-    // a "strm" command that arrived first is parked (checked above), so a
-    // late STMd can no longer hit the NEW stream.
-    Serial.println("Audio stream ended");
+    // Genuine end of stream (server closed the socket). Announce it to the
+    // server ("STMd") : without it LMS keeps the player in its playing state
+    // and never sends a new stream, so the next track would never start.
+    // Safe to send here : EOS is detected within ms of the socket close and a
+    // "strm" command that arrived first is parked (checked above), so a late
+    // STMd can never hit the NEW stream.
+    SendStatEvent("STMd", (millis() - StartTimeCurrentSong) / 1000,
+                  ByteReceivedCurrentSong);
 
-    reponseSTAT viDone(vcClient);
-    memcpy((void *) viDone.vcResponse.event, "STMd", 4);
-    viDone.vcResponse.elapsed_seconds = (millis() - StartTimeCurrentSong) / 1000;
-    viDone.vcResponse.bytes_received_L = ByteReceivedCurrentSong;
-    viDone.sendResponse();
-
-    vcPlayerStat = StopStatus;
-    StopDacPlayback();
+    StopDacPlayback();   // resets vcPlayerStat to StopStatus
   }
 
   return 0;
@@ -538,8 +544,8 @@ int slimproto::PumpControlDuringAudio()
 /**
  * Push silence into the I2S DMA while the stream is stalled, so the circular
  * DMA buffer gets overwritten with silence instead of re-emitting its last
- * content (the "stuck CD" sound heard when the server stops feeding data,
- * e.g. on a Spotify stop before the "strm q" arrives).
+ * content (e.g. while the server has stopped feeding data but the stop
+ * command has not arrived yet).
  */
 void slimproto::FeedIdleSamples()
 {
@@ -558,7 +564,7 @@ void slimproto::DeferStreamCmd(byte pCommand [], int pSize)
     Serial.println("Invalid strm command size, dropped");
     return;
   }
-  ByteArrayCpy(vcPendingCmd, pCommand, pSize);
+  memcpy(vcPendingCmd, pCommand, pSize);
   vcPendingSize = pSize;
   vcPendingStreamCmd = true;   // executed by HandleAudio()
 }
@@ -579,21 +585,27 @@ void slimproto::ExecutePendingStreamCmd()
 
 
 /**
+ * Send a SlimProto STAT event message.
+ */
+void slimproto::SendStatEvent(const char pEvent[4], uint32_t pElapsedSeconds,
+                              uint32_t pBytesReceived)
+{
+  reponseSTAT viResponse(vcClient);
+  memcpy((void *) viResponse.vcResponse.event, pEvent, 4);
+  viResponse.vcResponse.elapsed_seconds = pElapsedSeconds;
+  viResponse.vcResponse.bytes_received_L = pBytesReceived;
+  viResponse.sendResponse();
+}
+
+/**
  * Stop command
  */
 void slimproto::HandleStrmQCmd(byte pCommand [], int pSize)
 {
   Serial.println("strm q received");
-  StopDacPlayback();
+  StopDacPlayback();   // resets vcPlayerStat to StopStatus
 
-  vcPlayerStat = StopStatus;
-  EndTimeCurrentSong = millis();
-
-  reponseSTAT * viResponse = new reponseSTAT(vcClient);
-  memcpy((void *) viResponse->vcResponse.event, "STMf", 4);
-  viResponse->vcResponse.elapsed_seconds = 0;
-  viResponse->sendResponse();
-  delete viResponse;
+  SendStatEvent("STMf", 0, 0);
 }
 
 /**
@@ -620,6 +632,12 @@ void slimproto::HandleStrmTCmd(byte pCommand [], int pSize)
  */
 void slimproto::HandleStrmSCmd(byte pCommand [], int pSize)
 {
+  if (pSize < (int)(sizeof(StrmStruct) + 4))
+  {
+    Serial.println("strm s too short, dropped");
+    return;
+  }
+
   StrmStruct strmInfo;
   memcpy(&strmInfo, pCommand + 4, sizeof(strmInfo));
 
@@ -642,7 +660,7 @@ void slimproto::HandleStrmSCmd(byte pCommand [], int pSize)
       viNewGen = new AudioGeneratorWAV();
       viNewGen->RegisterStatusCB(StatusCallback, (void*) "wav");
       break;
-    case 'p':  // raw PCM (Spoton/Spotify)
+    case 'p':  // raw PCM
     {
       uint32_t viRate = pcmRateFromCode(strmInfo.pcmsamplerate);
       uint8_t  viCh   = (strmInfo.pcmchannels == '1') ? 1 : 2;
@@ -656,9 +674,9 @@ void slimproto::HandleStrmSCmd(byte pCommand [], int pSize)
     default:
       Serial.print("Format not supported in DAC mode : ");
       Serial.println((char) strmInfo.formatbyte);
-      reponseSTAT viStop(vcClient);
-      memcpy((void *) viStop.vcResponse.event, "STMf", 4);
-      viStop.sendResponse();
+      StopDacPlayback();
+      delete viNewGen;
+      SendStatEvent("STMf", 0, 0);
       return;
   }
 
@@ -672,7 +690,7 @@ void slimproto::HandleStrmSCmd(byte pCommand [], int pSize)
   if (viReqLen < 0) viReqLen = 0;
   byte viReq[viMaxReq + 8];
   memset(viReq, 0, sizeof(viReq));
-  ByteArrayCpy(viReq, pCommand + sizeof(strmInfo) + 4, viReqLen);
+  memcpy(viReq, pCommand + sizeof(strmInfo) + 4, viReqLen);
 
   // The request must end with an empty line
   if (viReqLen < 4
@@ -711,9 +729,7 @@ void slimproto::HandleStrmSCmd(byte pCommand [], int pSize)
     Serial.println("Unable to connect to the stream socket");
     delete vcStreamClient, vcStreamClient = 0;
     delete viNewGen;
-    reponseSTAT viStop(vcClient);
-    memcpy((void *) viStop.vcResponse.event, "STMf", 4);
-    viStop.sendResponse();
+    SendStatEvent("STMf", 0, 0);
     return;
   }
 
@@ -726,9 +742,7 @@ void slimproto::HandleStrmSCmd(byte pCommand [], int pSize)
     Serial.println("No stream response headers from server");
     StopDacPlayback();
     delete viNewGen;
-    reponseSTAT viStop(vcClient);
-    memcpy((void *) viStop.vcResponse.event, "STMf", 4);
-    viStop.sendResponse();
+    SendStatEvent("STMf", 0, 0);
     return;
   }
 
@@ -748,9 +762,7 @@ void slimproto::HandleStrmSCmd(byte pCommand [], int pSize)
   {
     Serial.println("Decoder failed to start");
     StopDacPlayback();
-    reponseSTAT viStop(vcClient);
-    memcpy((void *) viStop.vcResponse.event, "STMf", 4);
-    viStop.sendResponse();
+    SendStatEvent("STMf", 0, 0);
     return;
   }
 
@@ -761,31 +773,20 @@ void slimproto::HandleStrmSCmd(byte pCommand [], int pSize)
   Serial.printf("Playback started - free heap %u bytes\n", ESP.getFreeHeap());
 
   // Tell the server the stream is connected/started
-  reponseSTAT viResponseSTMc(vcClient);
-  memcpy((void *) viResponseSTMc.vcResponse.event, "STMc", 4);
-  viResponseSTMc.sendResponse();
-
-  reponseSTAT viResponseSTMe(vcClient);
-  memcpy((void *) viResponseSTMe.vcResponse.event, "STMe", 4);
-  viResponseSTMe.sendResponse();
-
-  reponseSTAT viResponseSTMh(vcClient);
-  memcpy((void *) viResponseSTMh.vcResponse.event, "STMh", 4);
-  viResponseSTMh.sendResponse();
-
-  reponseSTAT viResponseSTMs(vcClient);
-  memcpy((void *) viResponseSTMs.vcResponse.event, "STMs", 4);
-  viResponseSTMs.sendResponse();
+  SendStatEvent("STMc", 0, 0);
+  SendStatEvent("STMe", 0, 0);
+  SendStatEvent("STMh", 0, 0);
+  SendStatEvent("STMs", 0, 0);
 }
 
 /**
  * Handle pause command
  *
- * The decoder/generator is left running (so we can resume where we left off)
- * and the I2S output keeps running : HandleAudio() feeds silence while we
- * are paused. (Stopping the I2S channel here worked, but restarting it on
- * unpause made the PCM5102A pop/crackle, and refills start instantly this
- * way.)
+ * The decoder/generator is left running (so we can resume exactly where we
+ * left off) and the I2S output keeps running : HandleAudio() feeds silence
+ * while paused. Stopping the I2S channel on pause is not done : re-enabling
+ * it on unpause made the PCM5102A pop/crackle, and keeping it running makes
+ * refills resume instantly.
  */
 void slimproto::HandleStrmPCmd(byte pCommand [], int pSize)
 {
@@ -796,9 +797,7 @@ void slimproto::HandleStrmPCmd(byte pCommand [], int pSize)
   vcPlayerStat = PauseStatus;
 
   // Send Pause confirm
-  reponseSTAT viResponseSTMp(vcClient);
-  memcpy((void *) viResponseSTMp.vcResponse.event, "STMp", 4);
-  viResponseSTMp.sendResponse();
+  SendStatEvent("STMp", 0, 0);
 }
 
 /**
@@ -820,24 +819,48 @@ void slimproto::HandleStrmUCmd(byte pCommand [], int pSize)
   vcPlayerStat = PlayStatus;
 
   // Send UnPause confirm
-  reponseSTAT viResponseSTMp(vcClient);
-  memcpy((void *) viResponseSTMp.vcResponse.event, "STMr", 4);
-  viResponseSTMp.sendResponse();
+  SendStatEvent("STMr", 0, 0);
 }
 
 /**
- * Handle volume control (software gain applied in the I2S output)
+ * Handle volume control (software gain applied in the I2S output).
+ *
+ * The "adjust" flag tells us who applies the LMS volume (same behaviour as
+ * SqueezeLite) :
+ *  - adjust != 0 : LMS sends a full-scale stream and the player must scale it
+ *    to the sent gain. This is the case for native MP3/FLAC streams, which
+ *    LMS cannot attenuate without decoding.
+ *  - adjust == 0 : LMS has already scaled the stream data to its volume
+ *    (raw PCM transcodes, where the server can apply the gain during
+ *    conversion) and expects the player to stay at unity gain. Applying the
+ *    sent gain again would attenuate the stream twice and make it very quiet
+ *    compared to MP3 at the same volume.
  */
 void slimproto::HandleAudgCmd(byte pCommand [], int pSize)
 {
-  u32_t viVol = unpackN((u32_t *) (pCommand + 14));   // audg gainL
-  ApplyVolume(viVol);
+  // gainL / adjust are at fixed offsets (see the audg_packet layout)
+  if (pSize < (int) (offsetof(AudgStruct, gainL) + sizeof(u32_t)))
+    return;
+
+  const AudgStruct * pAudg = (const AudgStruct *) pCommand;
+
+  if (pAudg->adjust)
+  {
+    // gainL is 16.16 fixed point
+    u32_t viVol = unpackN((u32_t *) (pCommand + offsetof(AudgStruct, gainL)));
+    Serial.printf("audg volume : %u (adjust)\n", viVol);
+    ApplyVolume(viVol);
+  }
+  else
+  {
+    Serial.println("audg volume : 100%% (stream pre-scaled by LMS)");
+    ApplyVolume(65536);   // 100 % : the stream data already carries the volume
+  }
 }
 
 /**
  * Map a slimproto audg gain (16.16 fixed point, 65536 = 100%) to a software
- * gain on the samples (the PCM5102A has no volume register). LMS already
- * applies its volume curve server side, so the value is used as-is.
+ * gain on the samples (the PCM5102A has no volume register).
  */
 void slimproto::ApplyVolume(u32_t pVolume)
 {
@@ -857,9 +880,9 @@ void slimproto::ApplyVolume(u32_t pVolume)
  */
 void slimproto::StopDacPlayback()
 {
-  // NOTE : do not call vcDacOut->flush() here ! flush() plays out the whole
-  // queued DMA (that is the "stuck CD" replay). stop() below disables the
-  // channel and resets the DMA, discarding the pending samples.
+  // NOTE : do not call vcDacOut->flush() here. flush() plays out the whole
+  // queued DMA first, so a stopped/paused stream would replay its last audio.
+  // stop() below disables the channel and discards the pending DMA samples.
   if (vcDacAudioGen)
   {
     vcDacAudioGen->stop();
@@ -891,12 +914,17 @@ void slimproto::StopDacPlayback()
 
 void slimproto::HandleCommand(byte pCommand[], int pSize)
 {
-  byte viCommand[5] = {0};
+  if (pSize < 4)
+    return;   // too short to even hold the 4-byte command opcode
 
-  ByteArrayCpy(viCommand, pCommand, 4);
+  byte viCommand[5] = {0};
+  memcpy(viCommand, pCommand, 4);
 
   if(strcmp((const char *) viCommand, "strm") == 0)
   {
+    if (pSize < 5)
+      return;   // "strm" sub-command byte required
+
     unsigned char viSubCmd = (unsigned char) pCommand[4];
 
     switch (viSubCmd)
@@ -934,13 +962,6 @@ void slimproto::HandleCommand(byte pCommand[], int pSize)
     HandleAudgCmd(pCommand, pSize);
   }
 }
-
-void slimproto::ByteArrayCpy(byte * pDst, byte * pSrv, int pSize)
-{
-  for(int i = 0; i < pSize; i++)
-    pDst[i] = pSrv[i];
-}
-
 
 u32_t slimproto::unpackN(u32_t *src)
 {

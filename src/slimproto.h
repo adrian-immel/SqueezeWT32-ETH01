@@ -37,7 +37,7 @@ struct __attribute__((packed)) audg_packet {
   char  opcode[4];
   u32_t old_gainL;     // unused
   u32_t old_gainR;     // unused
-  u8_t  adjust;
+  u8_t  adjust;        // 1 = apply gainL/R as volume, 0 = LMS pre-scaled the stream data
   u8_t  preamp;        // unused
   u32_t gainL;
   u32_t gainR;
@@ -148,8 +148,8 @@ public:
 
   /**
    * Push silence samples into the I2S DMA while the stream is stalled.
-   * Without this, the circular DMA re-emits its last buffer forever
-   * (the "stuck CD" sound) while we wait for the server to resume or stop.
+   * Without this the circular DMA re-emits its last content forever while
+   * we wait for the server to resume or stop.
    **/
   void FeedIdleSamples();
 
@@ -167,19 +167,18 @@ private:
   void DeferStreamCmd(byte pCommand [], int pSize);
   void ExecutePendingStreamCmd();
 
-  void ByteArrayCpy(byte * pDst, byte * pSrv, int pSize);
-
   u32_t unpackN(u32_t *src);
 
   void StopDacPlayback();
   void ApplyVolume(u32_t pVolume);
+  void SendStatEvent(const char pEvent[4], uint32_t pElapsedSeconds,
+                     uint32_t pBytesReceived);
 
   String vcAdrLMS;
 
   int vcCommandSize;
 
   unsigned long StartTimeCurrentSong = 0;
-  unsigned long EndTimeCurrentSong = 0;
   uint32_t      ByteReceivedCurrentSong = 0;
 
   unsigned long LastStatMsg = 0;

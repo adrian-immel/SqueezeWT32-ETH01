@@ -11,7 +11,8 @@ project. Differences with the original:
 - Audio output is a **PCM5102A I2S DAC** driven by the
   [ESP8266Audio](https://github.com/earlephilhower/ESP8266Audio) software
   decoders (FLAC / MP3 / WAV) plus a small native decoder for raw **PCM**
-  streams (the latter is what the Spoton / Spotify plugin sends)
+  streams (SlimProto format `'p'`, as transcoded by the server for some
+  sources)
 - Advertised codecs are only the ones that work: `flc`, `pcm`, `mp3`
 - VS1053 module, ESP8266 and flac_plugin code removed
 - Bigger audio pipeline buffers (the WiFi stack no longer eats the RAM)
@@ -93,9 +94,14 @@ adapter or a downloader gizmo (see the
 Everything is in `src/config.h`:
 
 - I2S pins for the PCM5102A
-- `AUDIO_BUFFER_SIZE` : pre-decode network jitter buffer (default 24 KB,
-  was 4 KB). Raise it if your network has bursts, lower it if you get
+- `AUDIO_BUFFER_SIZE` : pre-decode network jitter buffer (default 64 KB).
+  When the server feeds faster than real time (FLAC/MP3) the buffer fills and
+  absorbs a stalling stream. Raw PCM (`'p'` format) arrives at real time, so
+  it only holds whatever the server already pushed. Lower it if you get
   allocation failures.
+- `AUDIO_BUFFER_REFILL_GOAL` : a blocking prefill returns once this much data
+  has arrived (~16 KB = ~93 ms of 44.1 kHz stereo PCM), keeping start latency
+  low while the buffer tops itself up in the background.
 - `AUDIO_DMA_BUFFER_COUNT` / `AUDIO_DMA_BUFFER_BYTES` : I2S DMA ring depth.
 - `UDP_PORT` / `LMS_PORT` : slimproto discovery/control port (default 3483).
 
