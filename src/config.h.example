@@ -48,7 +48,7 @@
  *                        stalling stream. Raw PCM (SlimProto format 'p')
  *                        arrives at real time, so the buffer only holds
  *                        whatever burst the server already pushed - it can
- *                        not grow on its own. Default 64 KB.
+ *                        not grow on its own. Default 128 KB.
  * AUDIO_BUFFER_REFILL_GOAL
  *                        a blocking prefill returns as soon as this many
  *                        bytes have arrived instead of waiting for a full
@@ -59,7 +59,7 @@
  *                        I2S DMA ring depth (SetBuffers()). More/larger DMA
  *                        buffers smooth out decoder timing glitches.
  * ---------------------------------------------------------------------- */
-#define AUDIO_BUFFER_SIZE        65536   /* 64 KB default */
+#define AUDIO_BUFFER_SIZE        131072  /* 128 KB default */
 #define AUDIO_BUFFER_REFILL_GOAL 16384
 #define AUDIO_DMA_BUFFER_COUNT   8
 #define AUDIO_DMA_BUFFER_BYTES   2304

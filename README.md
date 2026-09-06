@@ -94,7 +94,7 @@ adapter or a downloader gizmo (see the
 Everything is in `src/config.h`:
 
 - I2S pins for the PCM5102A
-- `AUDIO_BUFFER_SIZE` : pre-decode network jitter buffer (default 64 KB).
+- `AUDIO_BUFFER_SIZE` : pre-decode network jitter buffer (default 128 KB).
   When the server feeds faster than real time (FLAC/MP3) the buffer fills and
   absorbs a stalling stream. Raw PCM (`'p'` format) arrives at real time, so
   it only holds whatever the server already pushed. Lower it if you get

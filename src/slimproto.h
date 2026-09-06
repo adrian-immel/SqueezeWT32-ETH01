@@ -173,15 +173,18 @@ private:
   void ApplyVolume(u32_t pVolume);
   void SendStatEvent(const char pEvent[4], uint32_t pElapsedSeconds,
                      uint32_t pBytesReceived);
+  void SendProgressStat();
+  uint32_t ElapsedSeconds();
+  uint32_t ElapsedMs();
 
   String vcAdrLMS;
 
   int vcCommandSize;
 
-  unsigned long StartTimeCurrentSong = 0;
-  uint32_t      ByteReceivedCurrentSong = 0;
+  uint32_t ByteReceivedCurrentSong = 0;
 
   unsigned long LastStatMsg = 0;
+  unsigned long vLastProgressStat = 0;
 
   Client * vcClient;            // Client to handle control messages
 

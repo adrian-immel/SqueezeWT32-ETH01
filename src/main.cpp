@@ -29,6 +29,13 @@ WiFiClient     client;            // TCP connection to the LMS control port
 WiFiUDP        udp;               // Used for the LMS autodiscovery broadcast
 slimproto *    vislimCli = 0;
 
+// Pre-decode jitter buffer, allocated once at boot (see setup()) while the
+// heap is still contiguous. Allocating it per-track later often fails because
+// the heap has fragmented - AudioFileSourceBuffer would then silently fall
+// back to unbuffered reads.
+uint8_t *      gAudioBuffer = 0;
+uint32_t       gAudioBufferSize = 0;
+
 int       viCnxAttempt = -1;      // -1 => ask LMS_addr to be reset / rediscovered
 IPAddress LMS_addr(0, 0, 0, 0);
 
@@ -105,6 +112,19 @@ void setup()
   Serial.println("SqueezeWT32-ETH01 - Squeezebox player");
   Serial.printf("Compiled %s %s\n", __DATE__, __TIME__);
   Serial.printf("Free heap at boot : %u bytes\n", ESP.getFreeHeap());
+
+  // Reserve the jitter buffer now, while the heap is still unfragmented.
+  // Try the configured size first, then fall back to smaller powers of two.
+  for (uint32_t s = AUDIO_BUFFER_SIZE; s >= 16384; s >>= 1)
+  {
+    gAudioBuffer = (uint8_t *) malloc(s);
+    if (gAudioBuffer)
+    {
+      gAudioBufferSize = s;
+      break;
+    }
+  }
+  Serial.printf("Audio jitter buffer : %u bytes\n", gAudioBufferSize);
 
   ETH.begin(ETH_PHY_LAN8720, ETH_PHY_ADDR, ETH_PHY_MDC, ETH_PHY_MDIO,
             ETH_PHY_POWER, ETH_CLOCK_GPIO0_IN);

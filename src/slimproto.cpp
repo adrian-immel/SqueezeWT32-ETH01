@@ -2,6 +2,11 @@
 
 #include <WiFi.h>   // WiFiClient (NetworkClient) concrete type for the stream
 
+// Pre-decode jitter buffer allocated once at boot (main.cpp) while the heap
+// is unfragmented ; reused by every track.
+extern uint8_t * gAudioBuffer;
+extern uint32_t gAudioBufferSize;
+
 /*
  * NOTE : This is a trimmed down, Ethernet + PCM5102A (I2S) version of the
  * original SqueezeESP32 slimproto code. The VS1053 hardware decoder path and
@@ -335,6 +340,10 @@ private:
 /**
  * I2S output with the DMA state exposed (feed-idle-silence guard).
  *
+ * Counts audio frames delivered by the decoder (used for elapsed-time
+ * reporting). Idle silence fed while paused/stalled goes through feedSilence()
+ * and must NOT be counted - see below.
+ *
  * NOTE : never call flush() on this output. flush() plays out the whole DMA
  * queue before returning ; on a paused/stalled stream that replays the last
  * buffered audio. stop() disables the channel and discards the DMA instead.
@@ -342,6 +351,28 @@ private:
 class DacOutput : public AudioOutputI2S {
 public:
   bool isActive() { return i2sOn; }
+  uint32_t audioFrames() { return vAudioFrames; }
+  uint16_t sampleRate() { return hertz; }
+
+  virtual bool ConsumeSample(int16_t sample[2]) override {
+    if (AudioOutputI2S::ConsumeSample(sample)) {
+      vAudioFrames++;   // real decoder audio
+      return true;
+    }
+    return false;
+  }
+
+  // Push silence frames without counting them as audio (bypasses the
+  // counting override above by calling the base implementation directly).
+  void feedSilence() {
+    if (!isActive()) return;
+    static int16_t vZero[512];   // zeroed once : 256 stereo pairs
+    for (uint16_t i = 0; i < 256; i++)
+      AudioOutputI2S::ConsumeSample(vZero + (i << 1));
+  }
+
+private:
+  uint32_t vAudioFrames = 0;
 };
 
 
@@ -391,7 +422,26 @@ reponseSTAT::reponseSTAT(Client * pClient) : responseBase(pClient)
 void reponseSTAT::sendResponse()
 {
   memcpy((void *) vcResponse.opcode, "STAT", 4);
-  vcResponse.sizeResponse = __builtin_bswap32(sizeof(vcResponse) - 8);
+  vcResponse.sizeResponse = __builtin_bswap32(sizeof(vcResponse) - 8); // excludes the command opcode and size field
+
+  // SlimProto multi-byte fields are big-endian on the wire (like SqueezeLite's
+  // packN()). Without this, elapsed_seconds etc. would be read by the server
+  // byte-swapped - e.g. 38s looked like a huge value and the timeline jumped
+  // straight to "finished".
+  vcResponse.stream_buffer_size       = __builtin_bswap32(vcResponse.stream_buffer_size);
+  vcResponse.stream_buffer_fullness   = __builtin_bswap32(vcResponse.stream_buffer_fullness);
+  vcResponse.bytes_received_H         = __builtin_bswap32(vcResponse.bytes_received_H);
+  vcResponse.bytes_received_L         = __builtin_bswap32(vcResponse.bytes_received_L);
+  vcResponse.signal_strength          = __builtin_bswap16(vcResponse.signal_strength);
+  vcResponse.jiffies                  = __builtin_bswap32(vcResponse.jiffies);
+  vcResponse.output_buffer_size       = __builtin_bswap32(vcResponse.output_buffer_size);
+  vcResponse.output_buffer_fullness   = __builtin_bswap32(vcResponse.output_buffer_fullness);
+  vcResponse.elapsed_seconds          = __builtin_bswap32(vcResponse.elapsed_seconds);
+  vcResponse.voltage                  = __builtin_bswap16(vcResponse.voltage);
+  vcResponse.elapsed_milliseconds     = __builtin_bswap32(vcResponse.elapsed_milliseconds);
+  vcResponse.server_timestamp         = __builtin_bswap32(vcResponse.server_timestamp);
+  vcResponse.error_code               = __builtin_bswap16(vcResponse.error_code);
+
   vcClient->write((const uint8_t *) &vcResponse, sizeof(vcResponse));
 }
 
@@ -415,7 +465,6 @@ slimproto::slimproto(String pAdrLMS, Client * pClient)
   vcClient = pClient;
 
   LastStatMsg = millis();
-  StartTimeCurrentSong = 0;
   ByteReceivedCurrentSong = 0;
 
   Serial.printf("slimproto connected to LMS @ %s - free heap %u bytes\n",
@@ -504,6 +553,13 @@ int slimproto::HandleAudio()
     return 0;
   }
 
+  // Push the playback position to the server twice a second while playing.
+  if(millis() - vLastProgressStat >= 500UL)
+  {
+    vLastProgressStat = millis();
+    SendProgressStat();
+  }
+
   if(!vcDacAudioGen->loop())
   {
     if(vcPendingStreamCmd)
@@ -515,7 +571,7 @@ int slimproto::HandleAudio()
     // Safe to send here : EOS is detected within ms of the socket close and a
     // "strm" command that arrived first is parked (checked above), so a late
     // STMd can never hit the NEW stream.
-    SendStatEvent("STMd", (millis() - StartTimeCurrentSong) / 1000,
+    SendStatEvent("STMd", ElapsedSeconds(),
                   ByteReceivedCurrentSong);
 
     StopDacPlayback();   // resets vcPlayerStat to StopStatus
@@ -549,11 +605,8 @@ int slimproto::PumpControlDuringAudio()
  */
 void slimproto::FeedIdleSamples()
 {
-  if (vcDacOut && vcDacOut->isActive())
-  {
-    static int16_t silence[512];   // zeroed once : 256 stereo pairs
-    vcDacOut->ConsumeSamples(silence, 256);
-  }
+  if (vcDacOut)
+    vcDacOut->feedSilence();
 }
 
 
@@ -585,6 +638,43 @@ void slimproto::ExecutePendingStreamCmd()
 
 
 /**
+ * Played time in whole seconds, derived from the number of audio frames the
+ * decoder has written to the I2S output (like SqueezeLite). Wall clock is
+ * deliberately NOT used : it would run ahead whenever the stream stalls or
+ * when decoding is slower than real time (hi-res FLAC), and it would keep
+ * counting while paused.
+ */
+uint32_t slimproto::ElapsedSeconds()
+{
+  return ElapsedMs() / 1000;
+}
+
+uint32_t slimproto::ElapsedMs()
+{
+  if (!vcDacOut)
+    return 0;
+  uint16_t rate = vcDacOut->sampleRate();
+  if (!rate)
+    return 0;
+  return (uint32_t)(((uint64_t)vcDacOut->audioFrames() * 1000) / rate);
+}
+
+/**
+ * Push a progress STAT ("STMt") to the server. The server does not poll for
+ * position - like SqueezeLite we must send one every second while playing,
+ * otherwise the LMS timeline goes stale.
+ */
+void slimproto::SendProgressStat()
+{
+  reponseSTAT viResponse(vcClient);
+  memcpy((void *) viResponse.vcResponse.event, "STMt", 4);
+  viResponse.vcResponse.bytes_received_L = ByteReceivedCurrentSong;
+  viResponse.vcResponse.elapsed_seconds = ElapsedSeconds();
+  viResponse.vcResponse.elapsed_milliseconds = ElapsedMs();
+  viResponse.sendResponse();
+}
+
+/**
  * Send a SlimProto STAT event message.
  */
 void slimproto::SendStatEvent(const char pEvent[4], uint32_t pElapsedSeconds,
@@ -613,18 +703,8 @@ void slimproto::HandleStrmQCmd(byte pCommand [], int pSize)
  */
 void slimproto::HandleStrmTCmd(byte pCommand [], int pSize)
 {
-  reponseSTAT viResponse(vcClient);
-  memcpy((void *) viResponse.vcResponse.event, "STMt", 4);
-  viResponse.vcResponse.bytes_received_L = ByteReceivedCurrentSong;
-
-  // If current stat is 'stop' send 0 as elapsed time
-  if(vcPlayerStat == StopStatus)
-    viResponse.vcResponse.elapsed_seconds = 0;
-  else
-    viResponse.vcResponse.elapsed_seconds = (millis() - StartTimeCurrentSong) / 1000;
-
-  viResponse.sendResponse();
-  LastStatMsg = millis();
+  SendProgressStat();
+  LastStatMsg = millis();   // server asked, so it is alive
 }
 
 /**
@@ -749,7 +829,10 @@ void slimproto::HandleStrmSCmd(byte pCommand [], int pSize)
   // Wire the decode chain : stream socket -> jitter buffer -> gen -> I2S
   vcDacSrc = new StreamAudioSource(*vcStreamClient, this);
 
-  vcDacBuff = new AudioFileSourceBuffer(vcDacSrc, AUDIO_BUFFER_SIZE);
+  if (gAudioBuffer)
+    vcDacBuff = new AudioFileSourceBuffer(vcDacSrc, gAudioBuffer, gAudioBufferSize);
+  else
+    vcDacBuff = new AudioFileSourceBuffer(vcDacSrc, AUDIO_BUFFER_SIZE);
   vcDacBuff->RegisterStatusCB(StatusCallback, (void*) "buffer");
 
   vcDacOut = new DacOutput();
@@ -767,10 +850,11 @@ void slimproto::HandleStrmSCmd(byte pCommand [], int pSize)
   }
 
   vcPlayerStat = PlayStatus;
-  StartTimeCurrentSong = millis();
   ByteReceivedCurrentSong = 0;
+  vLastProgressStat = millis();
 
-  Serial.printf("Playback started - free heap %u bytes\n", ESP.getFreeHeap());
+  Serial.printf("Playback started - free heap %u bytes, largest block %u bytes\n",
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
   // Tell the server the stream is connected/started
   SendStatEvent("STMc", 0, 0);
