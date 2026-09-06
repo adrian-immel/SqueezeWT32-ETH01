@@ -48,19 +48,26 @@
  *                        stalling stream. Raw PCM (SlimProto format 'p')
  *                        arrives at real time, so the buffer only holds
  *                        whatever burst the server already pushed - it can
- *                        not grow on its own. Default 128 KB.
+ *                        not grow on its own.
  * AUDIO_BUFFER_REFILL_GOAL
  *                        a blocking prefill returns as soon as this many
  *                        bytes have arrived instead of waiting for a full
  *                        AUDIO_BUFFER_SIZE. Keeps the start-of-song gap at
  *                        ~93 ms of 44.1 kHz stereo PCM (~16 KB) and lets the
  *                        buffer top itself up in the background afterwards.
+ * PCM_PREROLL_BYTES      raw PCM ('p') streams arrive at real time, so they
+ *                        can not build up a cushion while playing. Wait for
+ *                        this many bytes before starting a PCM stream : the
+ *                        head start then absorbs short server-side feed gaps
+ *                        (e.g. when the LMS transcode hiccups on a volume
+ *                        change). ~0.37 s of 44.1 kHz stereo at 64 KB.
  * AUDIO_DMA_BUFFER_COUNT / AUDIO_DMA_BUFFER_BYTES
  *                        I2S DMA ring depth (SetBuffers()). More/larger DMA
  *                        buffers smooth out decoder timing glitches.
  * ---------------------------------------------------------------------- */
-#define AUDIO_BUFFER_SIZE        131072  /* 128 KB default */
+#define AUDIO_BUFFER_SIZE        131072   /* 128 KB */
 #define AUDIO_BUFFER_REFILL_GOAL 16384
+#define PCM_PREROLL_BYTES        65536    /* ~0.37 s of 44.1 kHz stereo PCM */
 #define AUDIO_DMA_BUFFER_COUNT   8
 #define AUDIO_DMA_BUFFER_BYTES   2304
 

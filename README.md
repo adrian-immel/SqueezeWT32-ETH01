@@ -79,7 +79,6 @@ ESP8266Audio decoder.
 Requires [PlatformIO](https://platformio.org/).
 
 ```sh
-cp src/config.h.example src/config.h   # optional : tweak buffer sizes
 pio run                                # build
 pio run -t upload                      # flash over the serial adapter
 pio device monitor                     # logs, 115200 baud
